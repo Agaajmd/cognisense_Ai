@@ -80,9 +80,56 @@ function getGeminiKey() {
   return (process.env.GEMINI_API_KEY || process.env.GEMINI_COGNISENSE || process.env.GEMINIAPIKEY || '').trim()
 }
 
+const GEMINI_QUOTA_COOLDOWN_MS = 15 * 60 * 1000
+let geminiQuotaBlockedUntil = 0
+
+function isQuotaLikeError(message: string) {
+  const text = message.toLowerCase()
+  return (
+    text.includes('quota') ||
+    text.includes('resource_exhausted') ||
+    text.includes('rate') ||
+    text.includes('billing') ||
+    text.includes('429') ||
+    text.includes('403')
+  )
+}
+
+function buildLocalAssistantReply(messages: ChatMessage[], locale: 'id' | 'en') {
+  const latestUser = messages
+    .slice()
+    .reverse()
+    .find(message => message.role === 'user')
+
+  const text = (latestUser?.content || '').toLowerCase()
+
+  if (locale === 'id') {
+    if (/badmood|mood jelek|kesal|emosi|marah/.test(text)) {
+      return 'Terima kasih sudah jujur. Saat mood sedang turun, hal kecil seperti jeda 2 menit untuk napas pelan sering membantu menurunkan intensitas emosi. Biasanya pemicu terkuat Anda hari ini apa?'
+    }
+    if (/cemas|anxious|khawatir|takut|panik/.test(text)) {
+      return 'Wajar merasa cemas ketika beban terasa banyak. Kita bisa mulai dari memetakan hal yang bisa Anda kontrol sekarang agar pikiran lebih terarah. Dari semua hal yang Anda khawatirkan, mana yang paling mendesak?'
+    }
+    if (/capek|lelah|burnout|stres|stress/.test(text)) {
+      return 'Kedengarannya energi Anda sedang terkuras. Kita bisa pilih satu langkah pemulihan yang realistis untuk 24 jam ke depan supaya beban terasa lebih ringan. Langkah kecil apa yang paling mungkin Anda lakukan malam ini?'
+    }
+    return 'Terima kasih sudah berbagi. Saya siap mendengarkan tanpa menghakimi, dan kita bisa uraikan pelan-pelan agar terasa lebih jelas. Hal yang paling mengganggu pikiran Anda sekarang apa?'
+  }
+
+  if (/anxious|panic|worried|fear/.test(text)) {
+    return 'It makes sense to feel anxious when pressure stacks up. We can start by separating what you can control right now from what you cannot. What feels most urgent at this moment?'
+  }
+  if (/tired|exhausted|burnout|stress/.test(text)) {
+    return 'It sounds like your energy is running low. Let us pick one realistic recovery step for the next 24 hours so things feel less heavy. What is one small action you can do tonight?'
+  }
+
+  return 'Thank you for sharing that. I am here to listen, and we can break this down step by step so it feels more manageable. What part is weighing on you the most right now?'
+}
+
 async function callGemini(prompt: string) {
   const apiKey = getGeminiKey()
   if (!apiKey) return null
+  if (Date.now() < geminiQuotaBlockedUntil) return null
 
   const models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-2.0-flash-001']
   let lastError = ''
@@ -111,7 +158,7 @@ async function callGemini(prompt: string) {
         const body = await response.json().catch(() => ({}))
         const message = body?.error?.message || `Gemini error ${response.status}`
         if (response.status === 429 || response.status === 403) {
-          throw new Error(message)
+          throw new Error(`QUOTA:${message}`)
         }
         if (response.status === 404 || response.status === 400) continue
         throw new Error(message)
@@ -130,6 +177,10 @@ async function callGemini(prompt: string) {
     } catch (error) {
       lastError = error instanceof Error ? error.message : 'Unknown Gemini error'
       console.error(`Gemini call failed on model ${model}: ${String(lastError).slice(0, 240)}`)
+      if (isQuotaLikeError(lastError)) {
+        geminiQuotaBlockedUntil = Date.now() + GEMINI_QUOTA_COOLDOWN_MS
+        break
+      }
     }
   }
 
@@ -269,9 +320,7 @@ export async function classifyProjectiveResponse(input: string, locale: 'id' | '
 export async function sendChatToGemini(messages: ChatMessage[], locale: 'id' | 'en') {
   try {
     if (!getGeminiKey()) {
-      return locale === 'id'
-        ? 'Koneksi AI belum aktif karena API key Gemini tidak ditemukan di server.'
-        : 'AI connection is not active because Gemini API key is missing on the server.'
+      return buildLocalAssistantReply(messages, locale)
     }
 
     const systemGuide =
@@ -299,21 +348,7 @@ export async function sendChatToGemini(messages: ChatMessage[], locale: 'id' | '
       : 'Thanks for sharing. Can you describe what has been the most stressful situation for you this week?'
   } catch (error) {
     console.error('Gemini chat error:', error)
-    const message = (error instanceof Error ? error.message : '').toLowerCase()
-    if (
-      message.includes('quota') ||
-      message.includes('resource_exhausted') ||
-      message.includes('rate') ||
-      message.includes('billing') ||
-      message.includes('429')
-    ) {
-      return locale === 'id'
-        ? 'AI Gemini terhubung, tetapi kuota API saat ini habis atau billing belum aktif. Mohon aktifkan kuota di Google AI Studio.'
-        : 'Gemini AI is connected, but API quota is exhausted or billing is not enabled. Please enable quota in Google AI Studio.'
-    }
-    return locale === 'id'
-      ? 'Terima kasih sudah berbagi. Apa satu hal yang paling membantu Anda merasa lebih tenang?'
-      : 'Thank you for sharing. What is one thing that helps you feel calmer?'
+    return buildLocalAssistantReply(messages, locale)
   }
 }
 

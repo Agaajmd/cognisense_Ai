@@ -8,6 +8,36 @@ import { estimateBiometricFromPhotos } from '@/lib/biometric-mediapipe'
 import { PrimaryButton } from '@/components/assessment/atoms/primary-button'
 import { SectionHeading } from '@/components/assessment/atoms/section-heading'
 
+function isLikelyMobileSafari() {
+  if (typeof navigator === 'undefined') return false
+  const ua = navigator.userAgent
+  const isIOS = /iPhone|iPad|iPod/i.test(ua)
+  const isWebkit = /WebKit/i.test(ua)
+  const isCriOS = /CriOS/i.test(ua)
+  const isFxiOS = /FxiOS/i.test(ua)
+  return isIOS && isWebkit && !isCriOS && !isFxiOS
+}
+
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, fallback: () => Promise<T>): Promise<T> {
+  let done = false
+  return Promise.race([
+    promise.then(value => {
+      done = true
+      return value
+    }),
+    new Promise<T>((resolve) => {
+      setTimeout(async () => {
+        if (done) return
+        resolve(await fallback())
+      }, ms)
+    }),
+  ])
+}
+
 export default function Phase2Biometric() {
   const { biometric, setBiometric, setCurrentPhase } = useAssessment()
   const { t } = useI18n()
@@ -37,9 +67,23 @@ export default function Phase2Biometric() {
   const waitWithCountdown = async (seconds: number) => {
     for (let i = seconds; i > 0; i -= 1) {
       setCountdown(i)
-      await new Promise(resolve => setTimeout(resolve, 1000))
+      await sleep(1000)
     }
     setCountdown(0)
+  }
+
+  const waitForVideoReady = async () => {
+    const video = videoRef.current
+    if (!video) return false
+
+    for (let i = 0; i < 25; i += 1) {
+      if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+        return true
+      }
+      await sleep(120)
+    }
+
+    return false
   }
 
   const captureFrame = () => {
@@ -57,60 +101,114 @@ export default function Phase2Biometric() {
   }
 
   const runCaptureSequence = async () => {
-    setScanning(true)
-    setAnalyzing(false)
-    setPermissionError('')
-    setCaptures([])
-
-    await new Promise(resolve => setTimeout(resolve, 600))
-
-    const shot1 = captureFrame()
-    setScanStep(t('phase2.step1'))
-    const batch1 = shot1 ? [shot1] : []
-    setCaptures(batch1)
-
-    await waitWithCountdown(3)
-    const shot2 = captureFrame()
-    setScanStep(t('phase2.step2'))
-    const batch2 = shot2 ? [...batch1, shot2] : [...batch1]
-    setCaptures(batch2)
-
-    await waitWithCountdown(3)
-    const shot3 = captureFrame()
-    setScanStep(t('phase2.step3'))
-    const batch3 = shot3 ? [...batch2, shot3] : [...batch2]
-    setCaptures(batch3)
-
-    setAnalyzing(true)
-    let analysis
     try {
-      analysis = await estimateBiometricFromPhotos(batch3)
-    } catch (error) {
-      console.error('MediaPipe analysis fallback:', error)
-      analysis = await analyzeBiometricPhotos(batch3)
-    }
+      setScanning(true)
+      setAnalyzing(false)
+      setPermissionError('')
+      setCaptures([])
 
-    setFormData(analysis)
-    setBiometric(analysis)
-    setAnalyzing(false)
-    setScanning(false)
+      const ready = await waitForVideoReady()
+      if (!ready) {
+        throw new Error('Camera stream is not ready')
+      }
+
+      await sleep(500)
+
+      const shot1 = captureFrame()
+      setScanStep(t('phase2.step1'))
+      const batch1 = shot1 ? [shot1] : []
+      setCaptures(batch1)
+
+      await waitWithCountdown(2)
+      const shot2 = captureFrame()
+      setScanStep(t('phase2.step2'))
+      const batch2 = shot2 ? [...batch1, shot2] : [...batch1]
+      setCaptures(batch2)
+
+      await waitWithCountdown(2)
+      const shot3 = captureFrame()
+      setScanStep(t('phase2.step3'))
+      const batch3 = shot3 ? [...batch2, shot3] : [...batch2]
+      setCaptures(batch3)
+
+      if (batch3.length < 3) {
+        throw new Error('Insufficient captures from camera stream')
+      }
+
+      setAnalyzing(true)
+      setScanStep(t('common.analyzing'))
+
+      const analysis = await withTimeout(
+        estimateBiometricFromPhotos(batch3),
+        8000,
+        () => analyzeBiometricPhotos(batch3)
+      )
+
+      setFormData(analysis)
+      setBiometric(analysis)
+    } catch (error) {
+      console.error('Biometric capture sequence failed:', error)
+      setPermissionError(t('phase2.permissionError'))
+    } finally {
+      setAnalyzing(false)
+      setScanning(false)
+    }
   }
 
   const startCamera = async () => {
     try {
       setPermissionError('')
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: 'user',
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('getUserMedia is not supported')
+      }
+
+      streamRef.current?.getTracks().forEach(track => track.stop())
+
+      const constraintQueue: MediaStreamConstraints[] = [
+        {
+          video: {
+            facingMode: { ideal: 'user' },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+          audio: false,
         },
-        audio: false,
-      })
+        {
+          video: {
+            facingMode: 'user',
+          },
+          audio: false,
+        },
+        {
+          video: true,
+          audio: false,
+        },
+      ]
+
+      let stream: MediaStream | null = null
+      for (const constraints of constraintQueue) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia(constraints)
+          break
+        } catch {
+          // Try a less strict constraint for Safari/device compatibility.
+        }
+      }
+
+      if (!stream) {
+        throw new Error('Unable to initialize camera stream')
+      }
 
       streamRef.current = stream
       if (videoRef.current) {
         videoRef.current.srcObject = stream
+        videoRef.current.muted = true
+        videoRef.current.playsInline = true
+        if (isLikelyMobileSafari()) {
+          videoRef.current.setAttribute('playsinline', 'true')
+          videoRef.current.setAttribute('muted', 'true')
+          videoRef.current.setAttribute('autoplay', 'true')
+        }
         await videoRef.current.play()
       }
 
