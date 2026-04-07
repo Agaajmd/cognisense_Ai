@@ -38,9 +38,16 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, fallback: () => P
   ])
 }
 
+function getBiometricProcessErrorMessage(localeHint: string) {
+  if (localeHint === 'id') {
+    return 'Pemindaian wajah belum berhasil. Pastikan wajah terlihat jelas, lalu coba Ambil Ulang 3 Foto.'
+  }
+  return 'Facial scan could not be completed. Make sure your face is clearly visible, then try Retake 3 Photos.'
+}
+
 export default function Phase2Biometric() {
   const { biometric, setBiometric, setCurrentPhase } = useAssessment()
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const [formData, setFormData] = useState(biometric)
   const [scanning, setScanning] = useState(false)
   const [analyzing, setAnalyzing] = useState(false)
@@ -100,6 +107,15 @@ export default function Phase2Biometric() {
     return canvas.toDataURL('image/jpeg', 0.9)
   }
 
+  const captureFrameWithRetry = async () => {
+    for (let i = 0; i < 5; i += 1) {
+      const shot = captureFrame()
+      if (shot) return shot
+      await sleep(180)
+    }
+    return ''
+  }
+
   const runCaptureSequence = async () => {
     try {
       setScanning(true)
@@ -114,41 +130,48 @@ export default function Phase2Biometric() {
 
       await sleep(500)
 
-      const shot1 = captureFrame()
+      const shot1 = await captureFrameWithRetry()
       setScanStep(t('phase2.step1'))
       const batch1 = shot1 ? [shot1] : []
       setCaptures(batch1)
 
       await waitWithCountdown(2)
-      const shot2 = captureFrame()
+      const shot2 = await captureFrameWithRetry()
       setScanStep(t('phase2.step2'))
       const batch2 = shot2 ? [...batch1, shot2] : [...batch1]
       setCaptures(batch2)
 
       await waitWithCountdown(2)
-      const shot3 = captureFrame()
+      const shot3 = await captureFrameWithRetry()
       setScanStep(t('phase2.step3'))
       const batch3 = shot3 ? [...batch2, shot3] : [...batch2]
       setCaptures(batch3)
 
-      if (batch3.length < 3) {
-        throw new Error('Insufficient captures from camera stream')
+      if (!batch3.length) {
+        throw new Error('No valid captures from camera stream')
       }
+
+      const normalizedBatch = [...batch3]
+      while (normalizedBatch.length < 3) {
+        normalizedBatch.push(normalizedBatch[normalizedBatch.length - 1])
+      }
+      setCaptures(normalizedBatch)
 
       setAnalyzing(true)
       setScanStep(t('common.analyzing'))
 
       const analysis = await withTimeout(
-        estimateBiometricFromPhotos(batch3),
+        estimateBiometricFromPhotos(normalizedBatch).catch(() => analyzeBiometricPhotos(normalizedBatch)),
         8000,
-        () => analyzeBiometricPhotos(batch3)
+        () => analyzeBiometricPhotos(normalizedBatch)
       )
 
       setFormData(analysis)
       setBiometric(analysis)
     } catch (error) {
       console.error('Biometric capture sequence failed:', error)
-      setPermissionError(t('phase2.permissionError'))
+      setPermissionError(getBiometricProcessErrorMessage(locale))
+      setScanStep(t('phase2.idle'))
     } finally {
       setAnalyzing(false)
       setScanning(false)
